@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/*.py", "use": "@vercel/python" }
+  ],
+  "routes": [
+    { "src": "/jobs",   "dest": "/api/jobs.py" },
+    { "src": "/status", "dest": "/api/status.py" },
+    { "src": "/scrape", "dest": "/api/scrape.py" },
+    { "src": "/",       "dest": "/api/index.py" }
+  ],
+  "crons": [
+    {
+      "path": "/scrape",
+      "schedule": "0 * * * *"
+    }
+  ]
+}
