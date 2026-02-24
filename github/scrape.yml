@@ -1,0 +1,28 @@
+name: 🇰🇪 Jobs Kenya — Auto Scraper
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Every hour, automatically, forever
+  workflow_dispatch:       # Also allows manual trigger from GitHub
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Run scraper
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        run: python scraper.py
