@@ -1,60 +1,159 @@
 """
-Shared helpers for Jobs Kenya Vercel API
+Shared helpers for Jobs Kenya Vercel API — uses Neon Postgres
 """
 import re, json, os, requests
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-# ── KV STORE (Vercel KV via REST API) ───────────────────────────
-KV_URL   = os.getenv('KV_REST_API_URL', '')
-KV_TOKEN = os.getenv('KV_REST_API_TOKEN', '')
-JOBS_KEY = 'jobs_kenya_v1'
+# ── NEON POSTGRES CONNECTION ─────────────────────────────────────
+# Vercel auto-adds POSTGRES_URL when you connect Neon
+DATABASE_URL = os.getenv('POSTGRES_URL', '')
 
-def kv_set(key, value):
-    """Save data to Vercel KV database"""
-    if not KV_URL or not KV_TOKEN:
-        return False
-    try:
-        res = requests.post(
-            f'{KV_URL}/set/{key}',
-            headers={'Authorization': f'Bearer {KV_TOKEN}'},
-            json=value,
-            timeout=10
-        )
-        return res.ok
-    except Exception as e:
-        print(f'KV set error: {e}')
-        return False
+def get_conn():
+    """Get a Postgres connection"""
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-def kv_get(key):
-    """Read data from Vercel KV database"""
-    if not KV_URL or not KV_TOKEN:
-        return None
+def init_db():
+    """Create jobs table if it doesn't exist"""
     try:
-        res = requests.get(
-            f'{KV_URL}/get/{key}',
-            headers={'Authorization': f'Bearer {KV_TOKEN}'},
-            timeout=10
-        )
-        if res.ok:
-            data = res.json()
-            return data.get('result')
-        return None
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS scraped_jobs (
+                id          TEXT PRIMARY KEY,
+                title       TEXT,
+                company     TEXT,
+                location    TEXT,
+                county      TEXT,
+                type        TEXT,
+                sector      TEXT,
+                salary      TEXT,
+                deadline    TEXT,
+                link        TEXT,
+                apply_email TEXT,
+                description TEXT,
+                source      TEXT,
+                scraped_at  TEXT
+            );
+            CREATE TABLE IF NOT EXISTS scraper_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print('DB initialized')
     except Exception as e:
-        print(f'KV get error: {e}')
-        return None
+        print(f'init_db error: {e}')
 
 def save_jobs(jobs):
-    payload = {
-        'total':      len(jobs),
-        'scraped_at': datetime.now().isoformat(),
-        'jobs':       jobs
-    }
-    kv_set(JOBS_KEY, payload)
-    return payload
+    """Save all jobs to Neon Postgres"""
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
 
-def load_jobs():
-    return kv_get(JOBS_KEY)
+        # Clear old jobs
+        cur.execute('DELETE FROM scraped_jobs')
+
+        # Insert new jobs
+        for j in jobs:
+            cur.execute('''
+                INSERT INTO scraped_jobs
+                (id, title, company, location, county, type, sector,
+                 salary, deadline, link, apply_email, description, source, scraped_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                    title=EXCLUDED.title, company=EXCLUDED.company,
+                    scraped_at=EXCLUDED.scraped_at
+            ''', (
+                j.get('id',''), j.get('title',''), j.get('company',''),
+                j.get('location',''), j.get('county',''), j.get('type',''),
+                j.get('sector',''), j.get('salary',''), j.get('deadline',''),
+                j.get('link',''), j.get('apply_email',''),
+                j.get('description','')[:2000], j.get('source',''),
+                j.get('scraped_at','')
+            ))
+
+        # Save last run time
+        now = datetime.now().isoformat()
+        cur.execute('''
+            INSERT INTO scraper_meta (key, value) VALUES ('last_run', %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        ''', (now,))
+        cur.execute('''
+            INSERT INTO scraper_meta (key, value) VALUES ('total_jobs', %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        ''', (str(len(jobs)),))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f'✅ {len(jobs)} jobs saved to Neon Postgres')
+        return {'total': len(jobs), 'scraped_at': now}
+    except Exception as e:
+        print(f'save_jobs error: {e}')
+        return {'total': 0, 'scraped_at': datetime.now().isoformat()}
+
+def load_jobs(county='', jtype='', keyword='', limit=80):
+    """Load jobs from Neon Postgres with optional filters"""
+    try:
+        conn   = get_conn()
+        cur    = conn.cursor()
+
+        query  = 'SELECT id,title,company,location,county,type,sector,salary,deadline,link,apply_email,description,source,scraped_at FROM scraped_jobs WHERE 1=1'
+        params = []
+
+        if county:
+            query += ' AND LOWER(county) LIKE %s'
+            params.append(f'%{county.lower()}%')
+        if jtype:
+            query += ' AND LOWER(type) LIKE %s'
+            params.append(f'%{jtype.lower()}%')
+        if keyword:
+            query += ' AND (LOWER(title) LIKE %s OR LOWER(company) LIKE %s)'
+            params.extend([f'%{keyword.lower()}%', f'%{keyword.lower()}%'])
+
+        query += ' ORDER BY scraped_at DESC LIMIT %s'
+        params.append(limit)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cols = ['id','title','company','location','county','type','sector',
+                'salary','deadline','link','apply_email','description','source','scraped_at']
+        jobs = [dict(zip(cols, row)) for row in rows]
+
+        # Get meta
+        cur.execute("SELECT value FROM scraper_meta WHERE key='last_run'")
+        row      = cur.fetchone()
+        last_run = row[0] if row else None
+
+        cur.close()
+        conn.close()
+        return {'total': len(jobs), 'scraped_at': last_run, 'jobs': jobs}
+    except Exception as e:
+        print(f'load_jobs error: {e}')
+        return {'total': 0, 'scraped_at': None, 'jobs': []}
+
+def get_status():
+    """Get scraper status from DB"""
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM scraper_meta WHERE key='last_run'")
+        r1       = cur.fetchone()
+        cur.execute("SELECT value FROM scraper_meta WHERE key='total_jobs'")
+        r2       = cur.fetchone()
+        cur.close()
+        conn.close()
+        return {
+            'status':     'ok' if r1 else 'no_data',
+            'total_jobs': int(r2[0]) if r2 else 0,
+            'last_run':   r1[0] if r1 else None,
+        }
+    except Exception as e:
+        return {'status': 'error', 'error': str(e), 'total_jobs': 0, 'last_run': None}
 
 
 # ── TEXT HELPERS ─────────────────────────────────────────────────
@@ -66,7 +165,7 @@ def strip_html(t):
 
 def extract_email(text):
     emails = re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', text or '')
-    bad = ['noreply','no-reply','donotreply','example','sentry','test@']
+    bad    = ['noreply','no-reply','donotreply','example','sentry','test@']
     return next((e for e in emails if not any(b in e.lower() for b in bad)), '')
 
 def extract_county(text):
@@ -85,25 +184,25 @@ def extract_county(text):
 def detect_type(text):
     t = (text or '').lower()
     if any(w in t for w in ['intern','attachment','graduate trainee']): return 'Internship'
-    if any(w in t for w in ['part-time','part time','casual']): return 'Part-Time'
-    if any(w in t for w in ['government','county','ministry','public service','psc']): return 'Government'
-    if any(w in t for w in ['ngo','unicef','undp','wfp','unhcr','oxfam','non-profit','nonprofit']): return 'NGO'
-    if any(w in t for w in ['remote','work from home','wfh']): return 'Remote'
-    if any(w in t for w in ['contract','consultant','temporary','freelance']): return 'Contract'
+    if any(w in t for w in ['part-time','part time','casual']):         return 'Part-Time'
+    if any(w in t for w in ['government','county','ministry','psc']):   return 'Government'
+    if any(w in t for w in ['ngo','unicef','undp','oxfam','non-profit']):return 'NGO'
+    if any(w in t for w in ['remote','work from home','wfh']):          return 'Remote'
+    if any(w in t for w in ['contract','consultant','temporary']):       return 'Contract'
     return 'Full-Time'
 
 def detect_sector(text):
     t = (text or '').lower()
-    if any(w in t for w in ['software','developer','ict','data','cyber','tech','systems']): return 'ICT & Technology'
-    if any(w in t for w in ['nurse','doctor','medical','health','clinical','pharmacy']): return 'Health & Medicine'
-    if any(w in t for w in ['finance','account','audit','tax','banking']): return 'Finance & Banking'
-    if any(w in t for w in ['engineer','civil','mechanical','electrical']): return 'Engineering'
-    if any(w in t for w in ['teach','tutor','lecturer','school','education']): return 'Education'
-    if any(w in t for w in ['farm','agri','crop','livestock','food']): return 'Agriculture'
-    if any(w in t for w in ['market','sales','brand','advertis','digital']): return 'Marketing & Sales'
-    if any(w in t for w in ['ngo','humanitarian','relief','programme']): return 'NGO / Non-Profit'
-    if any(w in t for w in ['legal','lawyer','advocate','compliance']): return 'Legal'
-    if any(w in t for w in ['driver','transport','logistics','supply']): return 'Transport & Logistics'
+    if any(w in t for w in ['software','developer','ict','data','cyber','tech']): return 'ICT & Technology'
+    if any(w in t for w in ['nurse','doctor','medical','health','clinical']):     return 'Health & Medicine'
+    if any(w in t for w in ['finance','account','audit','tax','banking']):        return 'Finance & Banking'
+    if any(w in t for w in ['engineer','civil','mechanical','electrical']):       return 'Engineering'
+    if any(w in t for w in ['teach','tutor','lecturer','school','education']):    return 'Education'
+    if any(w in t for w in ['farm','agri','crop','livestock','food']):            return 'Agriculture'
+    if any(w in t for w in ['market','sales','brand','advertis']):                return 'Marketing & Sales'
+    if any(w in t for w in ['ngo','humanitarian','relief','programme']):          return 'NGO / Non-Profit'
+    if any(w in t for w in ['legal','lawyer','advocate','compliance']):           return 'Legal'
+    if any(w in t for w in ['driver','transport','logistics','supply']):          return 'Transport & Logistics'
     return 'General'
 
 def deduplicate(jobs):
@@ -116,11 +215,10 @@ def deduplicate(jobs):
     return unique
 
 
-# ── SCRAPER FUNCTIONS ────────────────────────────────────────────
+# ── SCRAPERS ─────────────────────────────────────────────────────
 
 def scrape_reliefweb():
-    """ReliefWeb public API — NGO/UN jobs in Kenya"""
-    print('[ReliefWeb] Fetching...')
+    print('[ReliefWeb] Fetching NGO/UN jobs...')
     jobs = []
     try:
         url = (
@@ -135,9 +233,7 @@ def scrape_reliefweb():
             '&fields[include][]=url'
         )
         res = requests.get(url, timeout=25)
-        if not res.ok:
-            print(f'[ReliefWeb] HTTP {res.status_code}')
-            return []
+        if not res.ok: return []
         for item in res.json().get('data', []):
             try:
                 f       = item.get('fields', {})
@@ -146,7 +242,6 @@ def scrape_reliefweb():
                 sources = f.get('source', [])
                 company = sources[0].get('name', 'NGO') if sources else 'NGO'
                 body    = clean(strip_html(f.get('body', '')))
-                email   = extract_email(body)
                 date    = f.get('date', {}).get('created', datetime.now().isoformat())
                 jobs.append({
                     'id':          f"rw-{item.get('id', len(jobs))}",
@@ -159,7 +254,7 @@ def scrape_reliefweb():
                     'salary':      'Not stated',
                     'deadline':    '',
                     'link':        f.get('url', ''),
-                    'apply_email': email,
+                    'apply_email': extract_email(body),
                     'description': body[:2000],
                     'source':      'ReliefWeb',
                     'scraped_at':  date,
@@ -172,8 +267,7 @@ def scrape_reliefweb():
 
 
 def scrape_remotive():
-    """Remotive free API — remote jobs open to Kenya"""
-    print('[Remotive] Fetching...')
+    print('[Remotive] Fetching remote jobs...')
     jobs = []
     try:
         res = requests.get('https://remotive.com/api/remote-jobs?limit=50', timeout=25)
@@ -207,49 +301,38 @@ def scrape_remotive():
 
 
 def parse_rss(name, url):
-    """Parse RSS/Atom feed from any Kenyan job site"""
     print(f'[RSS] {name}...')
     jobs = []
     try:
         res = requests.get(url, timeout=25, headers={
-            'User-Agent': 'Mozilla/5.0 (compatible; JobsKenyaBot/1.0; +https://jobskenya.co.ke)'
+            'User-Agent': 'Mozilla/5.0 (compatible; JobsKenyaBot/1.0)'
         })
-        if not res.ok:
-            print(f'[RSS] {name} HTTP {res.status_code}')
-            return []
-
+        if not res.ok: return []
         root  = ET.fromstring(res.content)
         ns    = {'atom': 'http://www.w3.org/2005/Atom'}
         items = root.findall('.//item') or root.findall('.//entry') or root.findall('.//atom:entry', ns)
-
         for item in items[:40]:
             try:
                 def get(tag):
                     el = item.find(tag) or item.find(f'atom:{tag}', ns)
                     return clean(el.text or '') if el is not None and el.text else ''
-
                 title = get('title')
                 if not title or len(title) < 4: continue
-
-                desc  = clean(strip_html(get('description') or get('summary') or get('content') or ''))
-                link  = get('link')
+                desc    = clean(strip_html(get('description') or get('summary') or ''))
+                link    = get('link')
                 if not link:
-                    el = item.find('link') or item.find('atom:link', ns)
-                    link = el.get('href', '') if el is not None else ''
-
-                email   = extract_email(desc)
+                    el   = item.find('link') or item.find('atom:link', ns)
+                    link = el.get('href','') if el is not None else ''
                 company = name
-
-                # Extract company from title patterns
                 for sep in [' at ', ' - ', ' | ']:
                     if sep in title:
-                        parts   = title.split(sep, 1)
+                        parts = title.split(sep, 1)
                         title   = parts[0].strip()
                         company = parts[1].strip()
                         break
-
+                slug = re.sub(r'[^a-z]', '', name.lower())[:6]
                 jobs.append({
-                    'id':          f"{re.sub('[^a-z]','',name.lower())[:6]}-{len(jobs)}",
+                    'id':          f"{slug}-{len(jobs)}",
                     'title':       title,
                     'company':     company,
                     'location':    extract_county(title+' '+desc)+', Kenya',
@@ -259,13 +342,12 @@ def parse_rss(name, url):
                     'salary':      'Not stated',
                     'deadline':    '',
                     'link':        link,
-                    'apply_email': email,
+                    'apply_email': extract_email(desc),
                     'description': desc[:2000],
                     'source':      name,
                     'scraped_at':  datetime.now().isoformat(),
                 })
             except: continue
-
         print(f'[RSS] {name}: ✅ {len(jobs)} jobs')
     except Exception as e:
         print(f'[RSS] {name}: ❌ {e}')
@@ -282,13 +364,15 @@ RSS_SOURCES = [
 
 
 def run_all_scrapers():
-    """Run all scrapers and save to KV"""
+    """Run all scrapers and save results to Neon Postgres"""
     print('='*50)
-    print(f'🇰🇪 Scraping started: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'🇰🇪 Scraping: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     print('='*50)
+
+    # Ensure table exists
+    init_db()
 
     all_jobs = []
-
     try: all_jobs.extend(scrape_reliefweb())
     except Exception as e: print(f'❌ ReliefWeb: {e}')
 
@@ -301,19 +385,16 @@ def run_all_scrapers():
 
     before   = len(all_jobs)
     all_jobs = deduplicate(all_jobs)
-    all_jobs.sort(key=lambda j: j.get('scraped_at', ''), reverse=True)
     print(f'🧹 {before} → {len(all_jobs)} unique jobs')
 
-    result = save_jobs(all_jobs)
-    print(f'✅ {len(all_jobs)} jobs saved to KV!')
-    return result
+    return save_jobs(all_jobs)
 
 
 def json_response(handler, data, status=200):
-    body = json.dumps(data, ensure_ascii=False).encode()
+    body = json.dumps(data, ensure_ascii=False, default=str).encode()
     handler.send_response(status)
-    handler.send_header('Content-Type', 'application/json')
-    handler.send_header('Access-Control-Allow-Origin', '*')
+    handler.send_header('Content-Type',                 'application/json')
+    handler.send_header('Access-Control-Allow-Origin',  '*')
     handler.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     handler.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token')
     handler.end_headers()
